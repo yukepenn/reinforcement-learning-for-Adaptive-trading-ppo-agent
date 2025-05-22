@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.env
+env/
+venv/
+ENV/
+# Conda environments
+.conda/
+conda-meta/
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Jupyter Notebook
+.ipynb_checkpoints
+notebooks/.ipynb_checkpoints
+
+# IDE and editor specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Data files - A general rule, a project might want to track small sample data.
+# For large datasets, use Git LFS or store them externally.
+# Assuming data in these folders can be large or is dynamically generated.
+data/raw/*
+data/processed/*
+data/features/*
+# If you have specific small sample files you *do* want to track in these dirs,
+# you can negate them, e.g.:
+# !data/raw/sample_small_data.csv
+
+# Model files
+models/*.zip
+models/*.pkl
+models/*.onnx
+models/*.pt
+models/checkpoints/
+
+# Log files
+logs/
+*.log
+
+# Output directories (if any)
+results/
+figures/
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Cache files from various tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets - although these should ideally be outside the repo or managed by a secrets manager
+*.secrets
+*.key
+*.token
+credentials.*
+
+# Other
+*.bak
+*.tmp
+temp/
+tmp/
