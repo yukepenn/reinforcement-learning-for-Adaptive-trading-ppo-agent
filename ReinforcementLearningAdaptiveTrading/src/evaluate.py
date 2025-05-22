@@ -2,320 +2,350 @@ import argparse
 import os
 import pandas as pd
 import numpy as np
-import yaml # Or use json/configparser if preferred for config
+import yaml # For loading YAML config
+import matplotlib.pyplot as plt # For basic plotting
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-# Assuming other necessary modules will be created:
-from environment.trading_env import TradingEnv # Assuming TradingEnv is in environment/trading_env.py
-from data.data_loader import load_data, split_data # Assuming these are in data/data_loader.py
-# from data.feature_engineering import engineer_features # Assuming this function exists
-from utils.metrics import calculate_sharpe_ratio, max_drawdown, annualized_volatility, total_return # Assuming these in utils/metrics.py
-from config import DEFAULT_CONFIG # Assuming config.py will have this
+# Adjusted import paths (similar to train.py)
+# from environment.trading_env import TradingEnv
+# from data.data_loader import load_data # We'll load processed data directly
+# from utils.metrics import calculate_sharpe_ratio, max_drawdown, annualized_volatility, total_return # and others
+# from utils.config_loader import load_config
+# from utils.logger import setup_logger
+# from utils.plotting import plot_equity_curves # Will be created later
 
-def evaluate_agent(model, env, data_split_name="test"):
+# TEMPORARY: Direct imports assuming evaluate.py is in src/ for now
+from environment.trading_env import TradingEnv
+# We'll load processed data, so direct use of data_loader might not be needed here,
+# but feature_engineer might be for baselines if features aren't in the loaded test_df.
+from data_processing.feature_engineer import calculate_moving_average # For MA baseline
+import utils.metrics as metrics_module # Use as a module to avoid naming conflicts
+
+# Placeholder for logger
+# logger = print # Temporary, replace with actual logger
+
+# --- Agent Evaluation Function ---
+def evaluate_agent(model, env, config, logger, data_split_name="test"): # Added logger
     """
     Evaluates the trained agent on a given environment.
-    
-    :param model: The trained PPO model.
-    :param env: The Gym environment (preferably the test environment).
-    :param data_split_name: Name of the data split (e.g., "test", "validation") for logging.
-    :return: A dictionary of performance metrics.
     """
-    print(f"Evaluating agent on {data_split_name} data...")
+    logger.info(f"Evaluating agent on {data_split_name} data...")
+    
     obs = env.reset()
-    done = False
+    # done = False # Not needed as dones is a list from vecenv
     
     episode_rewards = []
-    portfolio_values = [] # To store portfolio value at each step for equity curve
+    portfolio_values = [] 
     all_actions = []
     
-    # Assuming the environment has access to its underlying data's length
-    # For a vectorized env, env.num_envs will be > 1. We evaluate on the first one.
-    # This loop structure might need adjustment if using vectorized env directly for evaluation.
-    # Typically, for evaluation, a single, non-vectorized env is preferred.
-    
-    current_portfolio_value = env.get_attr("initial_capital")[0] # Get from underlying env
-    portfolio_values.append(current_portfolio_value)
+    initial_capital = env.get_attr("initial_capital")[0]
+    portfolio_values.append(initial_capital)
 
-    # Determine number of steps based on the environment's data
-    # This is a heuristic; TradingEnv should ideally expose its data length
     num_steps = 0
+    # Try to get actual length from the DataFrame used by the environment instance
     if hasattr(env.unwrapped.envs[0], 'df') and env.unwrapped.envs[0].df is not None:
-        num_steps = len(env.unwrapped.envs[0].df) -1 # -1 because episode starts with reset
-    else: # Fallback if df is not directly accessible
-        print("Warning: Could not determine exact number of steps from env.df. Running for a default number of steps.")
-        num_steps = 252 # Default to one year of trading days if length unknown
-        if data_split_name == "test" and hasattr(env.unwrapped.envs[0], 'config'):
-            # Try to get test period length if possible
-            cfg = env.unwrapped.envs[0].config
-            test_start = pd.to_datetime(cfg.get('data',{}).get('test_period',{}).get('start', '2016-01-01'))
-            test_end = pd.to_datetime(cfg.get('data',{}).get('test_period',{}).get('end', '2023-12-31'))
-            # This is a rough estimate, actual days depend on data
-            num_steps = (test_end - test_start).days  * (252/365) # Approximate trading days
+        num_steps = len(env.unwrapped.envs[0].df) - 1 # df has dates, steps are transitions
+    else:
+        logger.warning("Could not determine exact number of steps from env.df. Evaluation might be incomplete.")
+        # Fallback: use test period from config to estimate, though less reliable
+        test_period_cfg = config.get('data', {}).get(f'{data_split_name}_period', {})
+        if test_period_cfg.get('start') and test_period_cfg.get('end'):
+            start_date = pd.to_datetime(test_period_cfg['start'])
+            end_date = pd.to_datetime(test_period_cfg['end'])
+            num_steps = (end_date - start_date).days # Approximation
+            logger.info(f"Estimated num_steps from config period: {num_steps}")
+        else:
+            num_steps = 252 # Default if no other info
+            logger.warning(f"Defaulting num_steps to {num_steps}")
 
 
-    for i in range(int(num_steps)): # Ensure num_steps is an integer
+    for i in range(int(num_steps)):
         action, _states = model.predict(obs, deterministic=True)
-        obs, rewards, dones, info = env.step(action)
+        obs, step_rewards, dones, infos = env.step(action) # step_rewards for clarity
         
-        all_actions.append(action[0] if isinstance(action, list) or isinstance(action, np.ndarray) else action)
-        episode_rewards.append(rewards[0] if isinstance(rewards, list) else rewards) # Assuming single env for eval
+        all_actions.append(action[0]) # Assuming single env for eval
+        episode_rewards.append(step_rewards[0])
         
-        # Portfolio value might be in info dict from TradingEnv
-        # If using multiple envs, info will be a list of dicts
-        current_portfolio_value = info[0].get('portfolio_value', portfolio_values[-1] + rewards[0])
+        current_portfolio_value = infos[0].get('portfolio_value', portfolio_values[-1] + step_rewards[0])
         portfolio_values.append(current_portfolio_value)
         
-        if dones[0] if isinstance(dones, list) else dones:
-            print(f"Episode finished after {i+1} steps.")
+        if dones[0]:
+            logger.info(f"Agent evaluation episode finished after {i+1} steps.")
             break
     
-    if not episode_rewards: # handles case where num_steps is 0 or very small
-        return {
-            "total_return_pct": 0,
-            "annualized_return_pct": 0,
-            "annualized_volatility_pct": 0,
-            "sharpe_ratio": 0,
-            "max_drawdown_pct": 0,
-            "average_reward": 0,
-            "actions": [],
-            "portfolio_values": portfolio_values
-        }
+    if not episode_rewards:
+        logger.warning("No rewards collected during agent evaluation.")
+        # Return structure with Nones or NaNs for metrics
+        return {m: 0 for m in ["total_return_pct", "annualized_return_pct", "annualized_volatility_pct", "sharpe_ratio", "max_drawdown_pct", "average_reward"]} | {"actions": [], "portfolio_values": portfolio_values}
 
-    # Calculate metrics
-    returns = pd.Series(episode_rewards) # Daily rewards can be treated as returns if reward = P&L
-    
-    # More accurately, use portfolio values for returns if reward is shaped
-    portfolio_returns = pd.Series(portfolio_values).pct_change().dropna()
 
-    metrics = {}
-    metrics["total_return_pct"] = total_return(pd.Series(portfolio_values)) * 100
-    metrics["annualized_return_pct"] = portfolio_returns.mean() * 252 * 100 # Assuming daily data
-    metrics["annualized_volatility_pct"] = annualized_volatility(portfolio_returns) * 100
-    metrics["sharpe_ratio"] = calculate_sharpe_ratio(portfolio_returns) # Assumes daily returns
-    metrics["max_drawdown_pct"] = max_drawdown(pd.Series(portfolio_values)) * 100
-    metrics["average_reward"] = np.mean(episode_rewards)
-    metrics["actions"] = all_actions
-    metrics["portfolio_values"] = portfolio_values
+    portfolio_series = pd.Series(portfolio_values)
+    daily_returns_series = portfolio_series.pct_change().dropna()
+
+    eval_metrics = {}
+    eval_metrics["total_return_pct"] = metrics_module.total_return(portfolio_series) * 100
+    eval_metrics["annualized_return_pct"] = metrics_module.annualized_return(daily_returns_series) * 100
+    eval_metrics["annualized_volatility_pct"] = metrics_module.annualized_volatility(daily_returns_series) * 100
+    eval_metrics["sharpe_ratio"] = metrics_module.sharpe_ratio(daily_returns_series, risk_free_rate=config['evaluation_params'].get('risk_free_rate', 0.0))
+    eval_metrics["max_drawdown_pct"] = metrics_module.max_drawdown(portfolio_series) * 100
+    eval_metrics["sortino_ratio"] = metrics_module.sortino_ratio(daily_returns_series, required_return=config['evaluation_params'].get('required_return_for_sortino', 0.0))
+    eval_metrics["calmar_ratio"] = metrics_module.calmar_ratio(portfolio_series)
+    eval_metrics["average_reward"] = np.mean(episode_rewards) if episode_rewards else 0
+    eval_metrics["actions"] = all_actions
+    eval_metrics["portfolio_values"] = portfolio_values # For plotting
     
-    print(f"--- Agent Performance on {data_split_name} ---")
-    for key, value in metrics.items():
+    logger.info(f"--- Agent Performance on {data_split_name} ---")
+    for key, value in eval_metrics.items():
         if key not in ["actions", "portfolio_values"]:
-            print(f"{key.replace('_', ' ').title()}: {value:.2f}")
+            logger.info(f"{key.replace('_', ' ').title()}: {value:.4f}")
     
-    return metrics
+    return eval_metrics
 
-def run_baseline_strategy(data_df, strategy_name="buy_and_hold", config=None):
+# --- Baseline Strategy Simulation ---
+def run_baseline_strategy(data_df, price_col, strategy_name, config, logger): # Added logger, price_col
     """
     Simulates a baseline trading strategy.
-    
-    :param data_df: DataFrame with price data (at least a 'price' column).
-    :param strategy_name: Name of the baseline strategy ("buy_and_hold", "ma_crossover").
-    :param config: Configuration dictionary, may contain parameters for strategies.
-    :return: A dictionary of performance metrics for the baseline.
+    `data_df` should be the same data the agent was evaluated on.
+    `price_col` is the name of the column holding the price data.
     """
-    print(f"Running baseline strategy: {strategy_name}...")
-    if data_df.empty or 'price' not in data_df.columns:
-        print(f"Price data is missing or empty for baseline: {strategy_name}.")
+    logger.info(f"Running baseline strategy: {strategy_name}...")
+    if data_df.empty or price_col not in data_df.columns:
+        logger.error(f"Price column '{price_col}' not found or data is empty for baseline: {strategy_name}.")
         return {}
 
-    initial_capital = config.get('environment_params', {}).get('initial_capital', 1000000)
+    initial_capital = config['environment_params'].get('initial_capital', 1000000)
     portfolio_values = [initial_capital]
-    actions = [] # 0: Short, 1: Flat, 2: Long
+    actions = [] # 0:S, 1:F, 2:L
 
     if strategy_name == "buy_and_hold":
-        # Assumes buying one unit whose value is the price. For futures, this needs adjustment.
-        # More simply, portfolio follows price changes.
-        price_at_start = data_df['price'].iloc[0]
+        price_at_start = data_df[price_col].iloc[0]
         for i in range(len(data_df)):
-            current_price = data_df['price'].iloc[i]
-            # Portfolio value relative to start, scaled by initial capital
-            pv = initial_capital * (current_price / price_at_start)
+            current_price = data_df[price_col].iloc[i]
+            pv = initial_capital * (current_price / price_at_start) if price_at_start != 0 else initial_capital
             portfolio_values.append(pv)
             actions.append(2) # Always Long
     
     elif strategy_name == "ma_crossover":
-        if 'short_ma' not in data_df.columns or 'long_ma' not in data_df.columns:
-            # Calculate MAs if not present (e.g., from feature_engineering.py)
-            # This is a placeholder; actual MA calculation should be robust.
-            ma_short_window = config.get('baseline_params',{}).get('ma_crossover',{}).get('short_window', 50)
-            ma_long_window = config.get('baseline_params',{}).get('ma_crossover',{}).get('long_window', 200)
-            data_df['short_ma'] = data_df['price'].rolling(window=ma_short_window).mean()
-            data_df['long_ma'] = data_df['price'].rolling(window=ma_long_window).mean()
-            data_df = data_df.dropna() # Drop NA results from rolling mean
-            if data_df.empty:
-                print("Not enough data for MA crossover after dropping NAs.")
-                return {}
+        ma_params = config['evaluation_params'].get('ma_crossover_baseline', {})
+        short_window = ma_params.get('short_window', 50)
+        long_window = ma_params.get('long_window', 200)
 
+        # Use pre-calculated MAs if available (e.g., from feature engineering step)
+        # Otherwise, calculate them here.
+        short_ma_col = f'sma_{short_window}' # Example naming convention
+        long_ma_col = f'sma_{long_window}'   # Example naming convention
 
-        position = 0 # Start flat
+        temp_df = data_df.copy() # Avoid modifying original df view
+        if short_ma_col not in temp_df.columns:
+            logger.info(f"Calculating short MA ({short_window}d) for baseline...")
+            temp_df[short_ma_col] = calculate_moving_average(temp_df[price_col], window=short_window)
+        if long_ma_col not in temp_df.columns:
+            logger.info(f"Calculating long MA ({long_window}d) for baseline...")
+            temp_df[long_ma_col] = calculate_moving_average(temp_df[price_col], window=long_window)
+        
+        temp_df = temp_df.dropna(subset=[short_ma_col, long_ma_col])
+        if temp_df.empty:
+            logger.warning("Not enough data for MA crossover after dropping NAs from MAs.")
+            return {}
+
+        position = 0 
         current_capital = initial_capital
-        
-        # Need to re-iterate for MA crossover based on its own logic for PV
-        portfolio_values = [initial_capital] # Reset for this strategy
-        
-        # Simplified P&L calculation for MA crossover (assumes 1 unit)
-        # More accurate simulation would use TradingEnv logic if possible
-        for i in range(1, len(data_df)): # Start from 1 because we look at previous day's signal for today's P&L
-            prev_price = data_df['price'].iloc[i-1]
-            current_price = data_df['price'].iloc[i]
+        portfolio_values = [initial_capital] # Reset for this strategy's PV calculation
+
+        for i in range(1, len(temp_df)):
+            prev_price = temp_df[price_col].iloc[i-1]
+            current_price = temp_df[price_col].iloc[i]
             price_change = current_price - prev_price
 
-            # Signal based on previous day's MAs
-            signal_long = data_df['short_ma'].iloc[i-1] > data_df['long_ma'].iloc[i-1]
-            signal_short = data_df['short_ma'].iloc[i-1] < data_df['long_ma'].iloc[i-1]
+            signal_long = temp_df[short_ma_col].iloc[i-1] > temp_df[long_ma_col].iloc[i-1]
+            signal_short = temp_df[short_ma_col].iloc[i-1] < temp_df[long_ma_col].iloc[i-1]
 
             daily_pnl = 0
-            if position == 1: # Long
-                daily_pnl = price_change
-            elif position == -1: # Short
-                daily_pnl = -price_change
+            if position == 1: daily_pnl = price_change    # Long
+            elif position == -1: daily_pnl = -price_change # Short
             
-            current_capital += daily_pnl # Ignores transaction costs for simplicity here
-            portfolio_values.append(current_capital)
+            # Transaction costs for MA crossover (simplified)
+            tc = 0
+            new_position_target = position
+            if signal_long: new_position_target = 1
+            elif signal_short: new_position_target = -1
+            else: new_position_target = 0 # Go flat if MAs are equal or signal unclear
 
-            if signal_long:
-                position = 1 # Go Long
-                actions.append(2)
-            elif signal_short:
-                position = -1 # Go Short
-                actions.append(0)
-            else: # MAs are equal or not enough data
-                position = 0 # Go Flat
-                actions.append(1)
+            if new_position_target != position: # If position changes
+                tc = config['environment_params'].get('transaction_cost_pct', 0.0001) * current_price # Simplified cost
+            
+            current_capital += (daily_pnl - tc)
+            portfolio_values.append(current_capital)
+            position = new_position_target
+            actions.append(position + 1) # Convert -1,0,1 to 0,1,2 for actions list
     
     elif strategy_name == "always_flat":
-        portfolio_values = [initial_capital] * (len(data_df) + 1) # +1 to match length if loop runs
+        portfolio_values = [initial_capital] * (len(data_df) +1) # Match length convention
         actions = [1] * len(data_df)
-
     else:
-        print(f"Unknown baseline strategy: {strategy_name}")
+        logger.warning(f"Unknown baseline strategy: {strategy_name}")
         return {}
 
-    if not portfolio_values or len(portfolio_values) <= 1: # Need at least 2 values for pct_change
-         return {
-            "total_return_pct": 0, "annualized_return_pct": 0, "annualized_volatility_pct": 0,
-            "sharpe_ratio": 0, "max_drawdown_pct": 0, "actions": actions, "portfolio_values": portfolio_values
-        }
+    if not portfolio_values or len(portfolio_values) <= 1:
+        return {m: 0 for m in ["total_return_pct", "annualized_return_pct", "annualized_volatility_pct", "sharpe_ratio", "max_drawdown_pct"]} | {"actions": actions, "portfolio_values": portfolio_values}
 
-    # Calculate metrics for baseline
-    portfolio_returns = pd.Series(portfolio_values).pct_change().dropna()
-    if portfolio_returns.empty: # Handle cases with no change or single value
-        metrics = {
-            "total_return_pct": 0, "annualized_return_pct": 0, "annualized_volatility_pct": 0,
-            "sharpe_ratio": 0, "max_drawdown_pct": 0
-        }
+    portfolio_series = pd.Series(portfolio_values)
+    daily_returns_series = portfolio_series.pct_change().dropna()
+
+    baseline_metrics = {}
+    if daily_returns_series.empty:
+         for m in ["total_return_pct", "annualized_return_pct", "annualized_volatility_pct", "sharpe_ratio", "max_drawdown_pct", "sortino_ratio", "calmar_ratio"]:
+             baseline_metrics[m] = 0.0
     else:
-        metrics = {}
-        metrics["total_return_pct"] = total_return(pd.Series(portfolio_values)) * 100
-        metrics["annualized_return_pct"] = portfolio_returns.mean() * 252 * 100
-        metrics["annualized_volatility_pct"] = annualized_volatility(portfolio_returns) * 100
-        metrics["sharpe_ratio"] = calculate_sharpe_ratio(portfolio_returns)
-        metrics["max_drawdown_pct"] = max_drawdown(pd.Series(portfolio_values)) * 100
-    
-    metrics["actions"] = actions
-    metrics["portfolio_values"] = portfolio_values
+        baseline_metrics["total_return_pct"] = metrics_module.total_return(portfolio_series) * 100
+        baseline_metrics["annualized_return_pct"] = metrics_module.annualized_return(daily_returns_series) * 100
+        baseline_metrics["annualized_volatility_pct"] = metrics_module.annualized_volatility(daily_returns_series) * 100
+        baseline_metrics["sharpe_ratio"] = metrics_module.sharpe_ratio(daily_returns_series, risk_free_rate=config['evaluation_params'].get('risk_free_rate', 0.0))
+        baseline_metrics["max_drawdown_pct"] = metrics_module.max_drawdown(portfolio_series) * 100
+        baseline_metrics["sortino_ratio"] = metrics_module.sortino_ratio(daily_returns_series, required_return=config['evaluation_params'].get('required_return_for_sortino', 0.0))
+        baseline_metrics["calmar_ratio"] = metrics_module.calmar_ratio(portfolio_series)
 
-    print(f"--- Baseline: {strategy_name} Performance ---")
-    for key, value in metrics.items():
+    baseline_metrics["actions"] = actions
+    baseline_metrics["portfolio_values"] = portfolio_values
+
+    logger.info(f"--- Baseline: {strategy_name} Performance ---")
+    for key, value in baseline_metrics.items():
         if key not in ["actions", "portfolio_values"]:
-            print(f"{key.replace('_', ' ').title()}: {value:.2f}")
+            logger.info(f"{key.replace('_', ' ').title()}: {value:.4f}")
             
-    return metrics
+    return baseline_metrics
+
+# --- Plotting Function (Example) ---
+def plot_equity_curves(results_dict, title="Equity Curves", save_path=None, logger=None):
+    plt.figure(figsize=(12, 7))
+    for strategy_name, metrics in results_dict.items():
+        if "portfolio_values" in metrics and metrics["portfolio_values"]:
+            # Ensure portfolio_values is a pandas Series for proper plotting if not already
+            pv_series = pd.Series(metrics["portfolio_values"])
+            plt.plot(pv_series.index, pv_series, label=strategy_name)
+    
+    plt.title(title)
+    plt.xlabel("Time Steps (or Date if index is datetime)")
+    plt.ylabel("Portfolio Value")
+    plt.legend()
+    plt.grid(True)
+    
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        if logger: logger.info(f"Equity curve plot saved to {save_path}")
+    plt.show()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate PPO Agent and Baselines for Adaptive Trading")
-    parser.add_argument("--config_path", type=str, default="src/config.py", help="Path to the configuration file")
+# --- Main Execution Block ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate PPO Agent and Baselines")
+    parser.add_argument("--config_path", type=str, default="configs/ppo_treasury_config.yaml", help="Path to YAML config file")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained PPO model (.zip file)")
     parser.add_argument("--data_split", type=str, default="test", choices=["train", "test", "validation"], help="Data split to evaluate on")
-    parser.add_argument("--vec_normalize_stats_path", type=str, default=None, help="Path to VecNormalize statistics (.pkl file) if environment was normalized during training")
+    # vec_normalize_stats_path can be part of config now
+    # parser.add_argument("--vec_normalize_stats_path", type=str, default=None, help="Path to VecNormalize stats")
 
     args = parser.parse_args()
 
-    # Load configuration
-    config = {}
-    if args.config_path.endswith('.py'):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("config_module", args.config_path)
-        config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(config_module)
-        config = getattr(config_module, 'DEFAULT_CONFIG', {})
-    elif args.config_path.endswith(('.yaml', '.yml')):
+    # --- Load Configuration ---
+    try:
         with open(args.config_path, 'r') as f:
             config = yaml.safe_load(f)
-    else:
-        print(f"Unsupported configuration file format: {args.config_path}. Using default config.")
-        config = DEFAULT_CONFIG
+    except FileNotFoundError:
+        print(f"ERROR: Configuration file not found at {args.config_path}")
+        exit(1)
+    except Exception as e:
+        print(f"ERROR: Could not load or parse configuration file {args.config_path}: {e}")
+        exit(1)
 
-    # Load data for the specified split
-    # This is a placeholder - actual data loading will depend on data_loader.py
-    print(f"Placeholder: Loading {args.data_split} data...")
-    # Example:
-    # raw_data = load_data(config['data']['raw_data_path']) 
-    # _, eval_df = split_data(raw_data, config['data']['train_period'], config['data'][f'{args.data_split}_period'])
-    # eval_features_df = engineer_features(eval_df) # From feature_engineering.py
-
-    # Create dummy data for now
-    dummy_dates = pd.to_datetime([f'2022-01-{i+1:02d}' for i in range(100)]) # Example test period
-    dummy_data_dict = {'price': np.random.rand(100) * 100 + 1200}
-    for feature_name in config.get('environment_params', {}).get('feature_columns', []):
-        dummy_data_dict[feature_name] = np.random.rand(100)
-    eval_df = pd.DataFrame(dummy_data_dict, index=dummy_dates)
-
-
-    # Create evaluation environment
-    env_kwargs = {'data': eval_df, 'config': config, 'current_step_in_df': 0} # current_step_in_df for TradingEnv
+    # --- Setup Logger (Placeholder) ---
+    class SimpleLogger: # Replace with actual logger setup
+        def info(self, msg): print(f"INFO: {msg}")
+        def warning(self, msg): print(f"WARNING: {msg}")
+        def error(self, msg, exc_info=False): print(f"ERROR: {msg}")
+    logger = SimpleLogger()
+    logger.info(f"Configuration loaded from {args.config_path}")
     
-    # For evaluation, typically use a single environment
-    # The make_vec_env or DummyVecEnv is often used for consistency with training if VecNormalize was used.
-    eval_env = DummyVecEnv([lambda: TradingEnv(**env_kwargs)])
+    # --- Load Data ---
+    data_cfg = config['data']
+    price_col = data_cfg['price_column']
+    processed_data_file = os.path.join(data_cfg['processed_data_path'], data_cfg.get(f'{args.data_split}_processed_filename', f'{args.data_split}_processed.csv'))
+    
+    if not os.path.exists(processed_data_file):
+        logger.error(f"Processed data file for split '{args.data_split}' not found at {processed_data_file}. Run preprocess_data.py first.")
+        exit(1)
+    
+    logger.info(f"Loading {args.data_split} data from {processed_data_file}...")
+    eval_df = pd.read_csv(processed_data_file, index_col='Date', parse_dates=True)
+    if eval_df.empty:
+        logger.error(f"Loaded data for {args.data_split} is empty.")
+        exit(1)
 
-    if args.vec_normalize_stats_path and os.path.exists(args.vec_normalize_stats_path):
-        print(f"Loading VecNormalize statistics from {args.vec_normalize_stats_path}")
-        eval_env = VecNormalize.load(args.vec_normalize_stats_path, eval_env)
-        eval_env.training = False # Important: set to False for evaluation
-        eval_env.norm_reward = False # Usually, do not normalize rewards during evaluation
-    elif config.get('training_params', {}).get('normalize_env', False) and not args.vec_normalize_stats_path:
-        print("Warning: Environment was normalized during training, but no vec_normalize_stats_path provided for evaluation. Observations might be scaled differently.")
+    # --- Environment Setup ---
+    env_kwargs = {'data_df': eval_df, 'config': config, 'current_step_in_df': 0}
+    eval_env = DummyVecEnv([lambda: TradingEnv(**env_kwargs)]) # No make_vec_env needed for single
 
+    vec_normalize_stats_path = config['training'].get('vec_normalize_stats_name', 'vec_normalize_stats.pkl')
+    full_vec_stats_path = os.path.join(config['training'].get('save_path', 'models/'), vec_normalize_stats_path)
 
-    # Load the trained model
+    if config['training'].get('normalize_env', False):
+        if os.path.exists(full_vec_stats_path):
+            logger.info(f"Loading VecNormalize statistics from {full_vec_stats_path}")
+            eval_env = VecNormalize.load(full_vec_stats_path, eval_env)
+            eval_env.training = False 
+            eval_env.norm_reward = False
+        else:
+            logger.warning(f"VecNormalize stats file not found at {full_vec_stats_path} but normalization was enabled. Evaluating with unnormalized env.")
+
+    # --- Load Model ---
     if not os.path.exists(args.model_path):
-        print(f"Error: Model file not found at {args.model_path}")
-        return
-        
-    print(f"Loading trained model from {args.model_path}...")
-    # Pass the eval_env if it's a VecNormalized environment to ensure consistency,
-    # though SB3 PPO.load usually handles this if the original env was normalized.
-    # For custom_objects, if any custom policies were used.
-    model = PPO.load(args.model_path, env=eval_env if args.vec_normalize_stats_path else None)
-    print("Model loaded successfully.")
+        logger.error(f"Model file not found at {args.model_path}")
+        exit(1)
+    logger.info(f"Loading trained model from {args.model_path}...")
+    model = PPO.load(args.model_path, env=eval_env) # SB3 handles VecNormalize if env is wrapped
+    logger.info("Model loaded successfully.")
 
-    # Evaluate the agent
-    agent_metrics = evaluate_agent(model, eval_env, data_split_name=args.data_split)
+    # --- Run Evaluations ---
+    all_results = {}
+    agent_metrics = evaluate_agent(model, eval_env, config, logger, data_split_name=args.data_split)
+    all_results["RL_Agent"] = agent_metrics
 
-    # Run baseline strategies
-    # Baselines need the raw DataFrame with prices and potentially features for MA crossover
-    baseline_buy_and_hold_metrics = run_baseline_strategy(eval_df.copy(), "buy_and_hold", config) # Pass copy
-    baseline_ma_crossover_metrics = run_baseline_strategy(eval_df.copy(), "ma_crossover", config) # Pass copy
-    baseline_always_flat_metrics = run_baseline_strategy(eval_df.copy(), "always_flat", config)
+    for baseline_name in config['evaluation_params'].get('baseline_strategies', []):
+        baseline_metrics = run_baseline_strategy(eval_df.copy(), price_col, baseline_name, config, logger)
+        all_results[baseline_name.replace("_", " ").title()] = baseline_metrics
+    
+    # --- Output Results ---
+    logger.info("--- Evaluation Summary ---")
+    # Create a DataFrame for summary table
+    summary_data = []
+    for strategy, mets in all_results.items():
+        if mets: # Check if metrics dict is not empty
+            summary_data.append({
+                "Strategy": strategy,
+                "Total Return %": mets.get("total_return_pct", 0),
+                "Annualized Return %": mets.get("annualized_return_pct", 0),
+                "Annualized Volatility %": mets.get("annualized_volatility_pct", 0),
+                "Sharpe Ratio": mets.get("sharpe_ratio", 0),
+                "Max Drawdown %": mets.get("max_drawdown_pct", 0)
+            })
+    summary_df = pd.DataFrame(summary_data)
+    logger.info("
+" + summary_df.to_string(index=False))
 
-    # Further: Compare metrics, generate plots (e.g., equity curves)
-    # This could be done here or by saving results to a file for notebook analysis.
-    print("\n--- Summary of Results ---")
-    # A simple print, could be a table or CSV output
-    if agent_metrics:
-      print(f"Agent Sharpe Ratio: {agent_metrics.get('sharpe_ratio', 'N/A'):.2f}, Max Drawdown: {agent_metrics.get('max_drawdown_pct', 'N/A'):.2f}%")
-    if baseline_buy_and_hold_metrics:
-      print(f"Buy & Hold Sharpe Ratio: {baseline_buy_and_hold_metrics.get('sharpe_ratio', 'N/A'):.2f}, Max Drawdown: {baseline_buy_and_hold_metrics.get('max_drawdown_pct', 'N/A'):.2f}%")
-    if baseline_ma_crossover_metrics:
-      print(f"MA Crossover Sharpe Ratio: {baseline_ma_crossover_metrics.get('sharpe_ratio', 'N/A'):.2f}, Max Drawdown: {baseline_ma_crossover_metrics.get('max_drawdown_pct', 'N/A'):.2f}%")
+    # Save summary to CSV
+    results_path = config['training'].get('log_path', 'logs/') # Use log_path for results too
+    os.makedirs(results_path, exist_ok=True)
+    summary_filename = os.path.join(results_path, f"evaluation_summary_{args.data_split}.csv")
+    summary_df.to_csv(summary_filename, index=False)
+    logger.info(f"Evaluation summary saved to {summary_filename}")
+
+    # Plotting
+    plot_save_path = os.path.join(results_path, f"equity_curve_{args.data_split}.png")
+    plot_equity_curves(all_results, title=f"Equity Curves - {args.data_split.title()} Data", save_path=plot_save_path, logger=logger)
 
     eval_env.close()
-    print("\nEvaluation script completed.")
-
-if __name__ == "__main__":
-    main()
+    logger.info("
+Evaluation script completed.")

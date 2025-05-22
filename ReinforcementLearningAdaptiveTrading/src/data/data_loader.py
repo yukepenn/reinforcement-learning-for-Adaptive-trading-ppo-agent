@@ -1,31 +1,27 @@
 import pandas as pd
 import os
 
-def load_data(file_path, date_column=None, expected_columns=None):
+# Dummy logger for standalone execution if actual logger isn't passed
+class SimpleLogger:
+    def debug(self, msg): print(f"DEBUG: {msg}")
+    def info(self, msg): print(f"INFO: {msg}")
+    def warning(self, msg): print(f"WARNING: {msg}")
+    def error(self, msg, exc_info=False): print(f"ERROR: {msg}")
+
+def load_data(file_path, logger=None, date_column=None, expected_columns=None): # Added logger
     """
     Loads data from a CSV file.
-
-    Args:
-        file_path (str): Path to the CSV data file.
-        date_column (str, optional): Name of the column to parse as dates.
-                                     If None, tries to infer.
-        expected_columns (list, optional): A list of column names expected to be in the CSV.
-                                           Raises ValueError if any are missing.
-
-    Returns:
-        pd.DataFrame: Loaded data as a pandas DataFrame.
-                      Returns an empty DataFrame if loading fails or file not found.
     """
+    if logger is None: logger = SimpleLogger()
+
     if not os.path.exists(file_path):
-        print(f"Error: Data file not found at {file_path}")
+        logger.error(f"Data file not found at {file_path}")
         return pd.DataFrame()
 
     try:
         if date_column:
             df = pd.read_csv(file_path, parse_dates=[date_column], index_col=date_column)
         else:
-            # Try to infer date column if not specified, by attempting to parse common date column names
-            # This is a basic attempt; more robust date parsing might be needed.
             df = pd.read_csv(file_path)
             potential_date_cols = ['Date', 'date', 'Time', 'time', 'Timestamp', 'timestamp']
             inferred_date_col = None
@@ -35,52 +31,42 @@ def load_data(file_path, date_column=None, expected_columns=None):
                         df[col] = pd.to_datetime(df[col])
                         df = df.set_index(col)
                         inferred_date_col = col
-                        print(f"Inferred and set '{inferred_date_col}' as DateTimeIndex.")
+                        logger.info(f"Inferred and set '{inferred_date_col}' as DateTimeIndex for {file_path}.")
                         break
                     except Exception as e:
-                        print(f"Could not parse column '{col}' as datetime: {e}")
+                        logger.warning(f"Could not parse column '{col}' as datetime in {file_path}: {e}")
             if not inferred_date_col and not isinstance(df.index, pd.DatetimeIndex):
-                 print("Warning: Could not automatically infer a date column or set a DatetimeIndex.")
-
-
-        print(f"Data loaded successfully from {file_path}. Shape: {df.shape}")
+                 logger.warning(f"Could not automatically infer a date column or set a DatetimeIndex for {file_path}.")
+        
+        logger.info(f"Data loaded successfully from {file_path}. Shape: {df.shape}")
 
         if expected_columns:
             missing_cols = [col for col in expected_columns if col not in df.columns]
             if missing_cols:
+                logger.error(f"Missing expected columns in loaded data from {file_path}: {missing_cols}")
                 raise ValueError(f"Missing expected columns in loaded data: {missing_cols}")
         
-        # Optional: sort by date index if it's a DatetimeIndex
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.sort_index()
             
         return df
 
-    except FileNotFoundError:
-        print(f"Error: Data file not found at {file_path}")
+    except FileNotFoundError: # Should be caught by os.path.exists, but good for robustness
+        logger.error(f"Data file not found at {file_path} (exception catch).")
         return pd.DataFrame()
     except Exception as e:
-        print(f"Error loading data from {file_path}: {e}")
+        logger.error(f"Error loading data from {file_path}: {e}", exc_info=True)
         return pd.DataFrame()
 
 
-def split_data(df, train_period_config, test_period_config, validation_period_config=None):
+def split_data(df, train_period_config, test_period_config, validation_period_config=None, logger=None): # Added logger
     """
-    Splits the DataFrame into training, testing, and optionally validation sets
-    based on date ranges specified in configuration dictionaries.
-
-    Args:
-        df (pd.DataFrame): The input DataFrame with a DatetimeIndex.
-        train_period_config (dict): Dict with 'start' and 'end' keys for training period.
-                                    Example: {'start': '2000-01-01', 'end': '2015-12-31'}
-        test_period_config (dict): Dict with 'start' and 'end' keys for testing period.
-        validation_period_config (dict, optional): Dict for validation period.
-
-    Returns:
-        tuple: (train_df, validation_df, test_df)
-               validation_df will be an empty DataFrame if validation_period_config is None.
+    Splits the DataFrame into training, testing, and optionally validation sets.
     """
+    if logger is None: logger = SimpleLogger()
+
     if not isinstance(df.index, pd.DatetimeIndex):
+        logger.error("DataFrame must have a DatetimeIndex for date-based splitting.")
         raise ValueError("DataFrame must have a DatetimeIndex for date-based splitting.")
 
     try:
@@ -93,59 +79,79 @@ def split_data(df, train_period_config, test_period_config, validation_period_co
         test_df = df.loc[test_start:test_end].copy()
         
         validation_df = pd.DataFrame()
-        if validation_period_config:
+        if validation_period_config and validation_period_config.get('start') and validation_period_config.get('end'):
             val_start = pd.to_datetime(validation_period_config['start'])
             val_end = pd.to_datetime(validation_period_config['end'])
             validation_df = df.loc[val_start:val_end].copy()
-            print(f"Validation data: {len(validation_df)} rows from {val_start.date()} to {val_end.date()}")
+            logger.info(f"Validation data: {len(validation_df)} rows from {val_start.date()} to {val_end.date()}")
+        else:
+            logger.info("No valid validation period configuration provided, validation_df will be empty.")
 
-        print(f"Training data: {len(train_df)} rows from {train_start.date()} to {train_end.date()}")
-        print(f"Test data: {len(test_df)} rows from {test_start.date()} to {test_end.date()}")
+
+        logger.info(f"Training data: {len(train_df)} rows from {train_start.date()} to {train_end.date()}")
+        logger.info(f"Test data: {len(test_df)} rows from {test_start.date()} to {test_end.date()}")
         
-        # Check for data leakage (overlap between train and test)
         if not train_df.empty and not test_df.empty:
             if train_df.index.max() >= test_df.index.min():
-                print("Warning: Training data might overlap with or succeed test data. Ensure periods are distinct.")
+                logger.warning("Training data might overlap with or succeed test data. Ensure periods are distinct and correctly ordered.")
         if not validation_df.empty and not test_df.empty:
-             if validation_df.index.max() >= test_df.index.min() and validation_df.index.min() < test_df.index.max() : # more robust overlap check
-                print("Warning: Validation data might overlap with test data. Ensure periods are distinct if strict separation is needed.")
-
+             if validation_df.index.max() >= test_df.index.min() and validation_df.index.min() < test_df.index.max():
+                logger.warning("Validation data might overlap with test data. Ensure periods are distinct if strict separation is needed.")
 
         return train_df, validation_df, test_df
 
     except KeyError as e:
-        print(f"Error: Missing 'start' or 'end' key in period configuration: {e}")
+        logger.error(f"Missing 'start' or 'end' key in period configuration: {e}", exc_info=True)
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     except Exception as e:
-        print(f"Error splitting data: {e}")
+        logger.error(f"Error splitting data: {e}", exc_info=True)
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# Placeholder for adding external data if needed
-def add_external_data(df, external_data_path_dict):
+def add_external_data(df, external_data_sources_config, logger=None): # Added logger, changed arg name
     """
-    Example function to merge external data sources.
+    Merges external data sources specified in the configuration.
+    Example: external_data_sources_config = [{'name': 'yields', 'path': 'path/to/yields.csv', 'date_col': 'Date'}]
+    """
+    if logger is None: logger = SimpleLogger()
     
-    Args:
-        df (pd.DataFrame): Main DataFrame.
-        external_data_path_dict (dict): Dict where keys are names (e.g., "yield_curve")
-                                        and values are paths to CSV files.
-    Returns:
-        pd.DataFrame: DataFrame merged with external data.
-    """
-    # Example: Merge yield curve data
-    # if "yields" in external_data_path_dict:
-    #     yield_df = load_data(external_data_path_dict["yields"], date_column='Date')
-    #     df = pd.merge(df, yield_df, left_index=True, right_index=True, how='left')
-    #     df = df.fillna(method='ffill') # Forward fill NaNs after merge
-    print("Placeholder: add_external_data function called. Implement actual merging logic.")
-    return df
+    if not external_data_sources_config:
+        logger.info("No external data sources configured to add.")
+        return df
+
+    merged_df = df.copy()
+    for source in external_data_sources_config:
+        name = source.get('name')
+        path = source.get('path')
+        date_col = source.get('date_col', 'Date') # Default date column name for external sources
+        
+        if not name or not path:
+            logger.warning(f"Skipping external data source due to missing name or path: {source}")
+            continue
+            
+        logger.info(f"Loading external data source '{name}' from '{path}'...")
+        ext_df = load_data(path, logger=logger, date_column=date_col) # Pass logger
+        
+        if not ext_df.empty:
+            # Ensure no duplicate columns other than index before merge, suffix if needed
+            common_cols = merged_df.columns.intersection(ext_df.columns)
+            if not common_cols.empty:
+                logger.warning(f"External data '{name}' has common columns with main data: {common_cols.tolist()}. Suffixing external columns with '_{name}'.")
+                ext_df = ext_df.rename(columns={c: f"{c}_{name}" for c in common_cols})
+
+            merged_df = pd.merge(merged_df, ext_df, left_index=True, right_index=True, how='left')
+            # Consider ffill carefully, it might introduce lookahead if external data is sparse and not aligned
+            # merged_df = merged_df.fillna(method='ffill') 
+            logger.info(f"Successfully merged external data '{name}'.")
+        else:
+            logger.warning(f"External data source '{name}' from '{path}' was empty or failed to load.")
+            
+    return merged_df
 
 
 if __name__ == '__main__':
-    # Example Usage:
-    print("\nExample Usage of data_loader.py:")
+    test_logger = SimpleLogger() # Use SimpleLogger for standalone test
+    test_logger.info("Example Usage of data_loader.py:")
 
-    # Create a dummy CSV file for testing
     dummy_data_file = "dummy_market_data.csv"
     dates = pd.to_datetime(['2010-01-01', '2010-01-02', '2010-01-03', '2010-01-04', '2010-01-05',
                             '2011-01-01', '2011-01-02', '2011-01-03', '2011-01-04', '2011-01-05'])
@@ -155,37 +161,28 @@ if __name__ == '__main__':
         'volume': [10, 12, 11, 13, 10, 15, 16, 14, 17, 13]
     })
     dummy_df_content.to_csv(dummy_data_file, index=False)
-    print(f"Created dummy data file: {dummy_data_file}")
+    test_logger.info(f"Created dummy data file: {dummy_data_file}")
 
-    # 1. Load data
-    loaded_df = load_data(dummy_data_file, date_column='Date', expected_columns=['price', 'volume'])
+    loaded_df = load_data(dummy_data_file, logger=test_logger, date_column='Date', expected_columns=['price', 'volume'])
     if not loaded_df.empty:
-        print("\nLoaded DataFrame head:")
-        print(loaded_df.head())
+        test_logger.info("Loaded DataFrame head:")
+        test_logger.info(loaded_df.head().to_string())
 
-        # 2. Define split periods
         train_p = {'start': '2010-01-01', 'end': '2010-12-31'}
-        val_p = {'start': '2010-01-03', 'end': '2010-01-05'} # Example validation within train for testing split
+        val_p = {'start': '2010-01-03', 'end': '2010-01-05'} 
         test_p = {'start': '2011-01-01', 'end': '2011-12-31'}
 
-        # 3. Split data
-        train_data, val_data, test_data = split_data(loaded_df, train_p, test_p, val_p)
+        train_data, val_data, test_data = split_data(loaded_df, train_p, test_p, val_p, logger=test_logger)
 
-        print(f"\nTrain data shape: {train_data.shape}")
-        if not train_data.empty: print(train_data.head(2))
-        print(f"Validation data shape: {val_data.shape}")
-        if not val_data.empty: print(val_data.head(2))
-        print(f"Test data shape: {test_data.shape}")
-        if not test_data.empty: print(test_data.head(2))
-        
-        # Test splitting with no validation
-        train_data_no_val, _, test_data_no_val = split_data(loaded_df, train_p, test_p)
-        print(f"\nTrain data (no val specified) shape: {train_data_no_val.shape}")
-        
+        test_logger.info(f"Train data shape: {train_data.shape}")
+        if not train_data.empty: test_logger.info(train_data.head(2).to_string())
+        test_logger.info(f"Validation data shape: {val_data.shape}")
+        if not val_data.empty: test_logger.info(val_data.head(2).to_string())
+        test_logger.info(f"Test data shape: {test_data.shape}")
+        if not test_data.empty: test_logger.info(test_data.head(2).to_string())
     else:
-        print("Failed to load dummy data.")
+        test_logger.error("Failed to load dummy data.")
 
-    # Clean up dummy file
     if os.path.exists(dummy_data_file):
         os.remove(dummy_data_file)
-        print(f"Removed dummy data file: {dummy_data_file}")
+        test_logger.info(f"Removed dummy data file: {dummy_data_file}")

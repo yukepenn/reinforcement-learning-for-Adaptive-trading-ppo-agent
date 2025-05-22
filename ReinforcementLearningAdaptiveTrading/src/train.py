@@ -1,217 +1,226 @@
 import argparse
 import os
-import yaml # Or use json/configparser if preferred for config
+import yaml # For loading YAML config
+import pandas as pd # Added for placeholder data
+import numpy as np  # Added for placeholder data
+
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnRewardThreshold, CheckpointCallback # Import necessary callbacks
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback # Using SB3's EvalCallback
 
-# Assuming other necessary modules will be created:
+# Adjusted import paths assuming train.py might be in 'scripts/' later,
+# and 'src' is the root for these modules.
+# This might require PYTHONPATH setup or installing the src package.
+# For now, if train.py remains in src/, these are:
+# from environment.trading_env import TradingEnv
+# from data.data_loader import load_data, split_data
+# from data.feature_engineering import engineer_features 
+# from utils.config_loader import load_config # Will be created later
+# from utils.logger import setup_logger # Will be created later
+
+# TEMPORARY: Direct imports assuming train.py is in src/ for now
+# These will be updated once directory structure is finalized and utils are created.
 from environment.trading_env import TradingEnv
-from data.data_loader import load_data, split_data
-from utils.callbacks import SaveBestModelCallback # Assuming this will be a custom callback
-from config import DEFAULT_CONFIG # Assuming config.py will have this
+from data_processing.data_loader import load_data, split_data # Assuming move to data_processing
+from data_processing.feature_engineer import engineer_features # Assuming move to data_processing
+# from utils.callbacks import LoggingCallback # Assuming this custom one might still be used
 
-def train_agent(config):
+# Placeholder for logger - will be replaced by proper logger from utils.logger
+# logger = print # Temporary redirect, replace with actual logger object
+
+# --- Main Training Function ---
+def train_agent(config, logger): # Added logger as argument
     """
     Main function to train the RL agent.
-    Sets up the environment, model, and initiates training.
     """
-    print("Starting training process...")
+    logger.info("Starting training process...")
 
-    # Load data
-    # This is a placeholder. Actual data loading will depend on data_loader.py implementation
-    # For example:
-    # raw_data = load_data(config['data']['raw_data_path'])
-    # train_df, _ = split_data(raw_data, config['data']['train_period'], config['data']['test_period'])
-    # features_df = some_feature_engineering_function(train_df) # From feature_engineering.py
-    
-    # Placeholder for data - replace with actual data loading and feature engineering
-    # For the environment to initialize, it needs data.
-    # This part will need to be more robust once data_loader and feature_engineering are implemented.
-    print("Placeholder: Data loading and feature engineering would happen here.")
-    # Example: create dummy data for now if TradingEnv requires it for initialization
-    import pandas as pd
-    import numpy as np
-    dummy_dates = pd.to_datetime([f'2000-01-{i+1:02d}' for i in range(100)])
-    dummy_data_dict = {'price': np.random.rand(100) * 100 + 1000}
-    # Add dummy features that TradingEnv might expect based on config.py
-    for feature_name in config.get('environment_params', {}).get('feature_columns', []):
-        dummy_data_dict[feature_name] = np.random.rand(100)
-    
-    train_df = pd.DataFrame(dummy_data_dict, index=dummy_dates)
-    
-    print(f"Using {config.get('ppo_params', {}).get('n_envs', 1)} parallel environments.")
+    # --- Data Loading ---
+    # This section will use data_loader.py and feature_engineer.py
+    # It should load preprocessed data if available, or run preprocessing.
+    # For now, using placeholder logic.
+    processed_train_path = os.path.join(config['data']['processed_data_path'], config['data'].get('train_processed_filename', 'train_processed.csv'))
+    processed_val_path = os.path.join(config['data']['processed_data_path'], config['data'].get('val_processed_filename', 'val_processed.csv'))
 
-    # Create vectorized environments
-    # env_kwargs will pass data and config to each TradingEnv instance
-    env_kwargs = {'data': train_df, 'config': config}
-    env = make_vec_env(
+    if os.path.exists(processed_train_path) and os.path.exists(processed_val_path):
+        logger.info(f"Loading preprocessed training data from: {processed_train_path}")
+        train_df = pd.read_csv(processed_train_path, index_col='Date', parse_dates=True)
+        logger.info(f"Loading preprocessed validation data from: {processed_val_path}")
+        val_df = pd.read_csv(processed_val_path, index_col='Date', parse_dates=True)
+    else:
+        logger.warning("Preprocessed data not found. Using dummy data for training. Run preprocess_data.py first.")
+        # Create dummy data if preprocessed files don't exist
+        dummy_dates_train = pd.to_datetime([f'2000-01-{i+1:02d}' for i in range(200)])
+        dummy_data_train = {'price': np.random.rand(200) * 100 + 1000}
+        for feature_name in config['data'].get('feature_columns', []):
+            dummy_data_train[feature_name] = np.random.rand(200)
+        train_df = pd.DataFrame(dummy_data_train, index=dummy_dates_train)
+
+        dummy_dates_val = pd.to_datetime([f'2001-01-{i+1:02d}' for i in range(50)])
+        dummy_data_val = {'price': np.random.rand(50) * 100 + 1100}
+        for feature_name in config['data'].get('feature_columns', []):
+            dummy_data_val[feature_name] = np.random.rand(50)
+        val_df = pd.DataFrame(dummy_data_val, index=dummy_dates_val)
+        logger.info(f"Using dummy training data ({len(train_df)} rows) and validation data ({len(val_df)} rows).")
+
+
+    # --- Environment Setup ---
+    logger.info(f"Using {config['agent'].get('n_envs', 1)} parallel environments for training.")
+    
+    train_env_kwargs = {'data_df': train_df, 'config': config, 'current_step_in_df': 0}
+    train_env = make_vec_env(
         TradingEnv,
-        n_envs=config.get('ppo_params', {}).get('n_envs', 1),
-        env_kwargs=env_kwargs,
-        vec_env_cls=DummyVecEnv # Use DummyVecEnv for single-process vectorization
+        n_envs=config['agent'].get('n_envs', 1),
+        env_kwargs=train_env_kwargs,
+        vec_env_cls=DummyVecEnv
     )
 
-    # Optional: Wrap with VecNormalize for observation and reward normalization
-    if config.get('training_params', {}).get('normalize_env', False):
-        print("Normalizing environment observations and rewards.")
-        env = VecNormalize(env, norm_obs=True, norm_reward=True, gamma=config.get('ppo_params',{}).get('gamma', 0.99))
-        # Important: Save the VecNormalize statistics when saving the model
-        # And load them when evaluating or resuming training
+    eval_env_kwargs = {'data_df': val_df, 'config': config, 'current_step_in_df': 0}
+    eval_env = make_vec_env(
+        TradingEnv, # Create a single env for evaluation
+        n_envs=1,
+        env_kwargs=eval_env_kwargs,
+        vec_env_cls=DummyVecEnv
+    )
 
-    # Define the PPO model
-    # policy_kwargs can be used for custom network architectures if needed
-    # For now, using default 'MlpPolicy'
+    if config['training'].get('normalize_env', False):
+        logger.info("Normalizing training and evaluation environments.")
+        train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, gamma=config['agent'].get('gamma', 0.99))
+        # Important: Save the VecNormalize statistics from train_env
+        # Load them onto eval_env but do not update them, and do not normalize reward
+        eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, gamma=config['agent'].get('gamma', 0.99))
+
+
+    # --- Agent Initialization ---
+    # PPO hyperparameters are taken from the 'agent' section of the config
+    ppo_hyperparams = config['agent'].copy()
+    # Remove non-PPO specific keys if any, or ensure PPO constructor handles extra keys
+    ppo_hyperparams.pop('n_envs', None) # n_envs is for make_vec_env
+
     model = PPO(
-        "MlpPolicy",
-        env,
-        learning_rate=config.get('ppo_params', {}).get('learning_rate', 3e-4),
-        n_steps=config.get('ppo_params', {}).get('n_steps', 2048),
-        batch_size=config.get('ppo_params', {}).get('batch_size', 64),
-        n_epochs=config.get('ppo_params', {}).get('n_epochs', 10),
-        gamma=config.get('ppo_params', {}).get('gamma', 0.99),
-        gae_lambda=config.get('ppo_params', {}).get('gae_lambda', 0.95),
-        clip_range=config.get('ppo_params', {}).get('clip_range', 0.2),
-        ent_coef=config.get('ppo_params', {}).get('ent_coef', 0.0),
-        vf_coef=config.get('ppo_params', {}).get('vf_coef', 0.5),
-        max_grad_norm=config.get('ppo_params', {}).get('max_grad_norm', 0.5),
-        tensorboard_log=config.get('training_params', {}).get('tensorboard_log_path', None),
-        verbose=config.get('training_params', {}).get('verbose', 1),
-        seed=config.get('training_params', {}).get('seed', None),
-        # policy_kwargs=config.get('policy_kwargs', None) # For custom network architecture
+        policy=ppo_hyperparams.pop('policy', 'MlpPolicy'), # Get policy, remove from dict
+        env=train_env,
+        tensorboard_log=os.path.join(config['training'].get('log_path', 'logs/'), 'tensorboard'),
+        verbose=config['training'].get('verbose', 1),
+        seed=config['training'].get('seed', None),
+        **ppo_hyperparams # Pass the rest of PPO params
     )
+    logger.info("PPO Model initialized.")
+    logger.info(f"Policy network architecture: {model.policy}")
 
-    print("PPO Model initialized.")
-    print(f"Policy network architecture: {model.policy}")
-
-    # Callbacks
-    callbacks = []
+    # --- Callbacks ---
+    callbacks_list = []
     
-    # Checkpoint callback to save model periodically
+    # Checkpoint callback
+    checkpoint_save_path = os.path.join(config['training'].get('save_path', 'models/'), 'checkpoints')
+    os.makedirs(checkpoint_save_path, exist_ok=True)
     checkpoint_cb = CheckpointCallback(
-        save_freq=max(config.get('training_params',{}).get('save_freq', 100000) // config.get('ppo_params',{}).get('n_envs',1), 1),
-        save_path=config.get('training_params',{}).get('model_save_path', './models/checkpoints/'),
-        name_prefix="ppo_trading_agent_checkpoint"
+        save_freq=max(config['training'].get('checkpoint_save_freq', 100000) // config['agent'].get('n_envs',1), 1),
+        save_path=checkpoint_save_path,
+        name_prefix="ppo_trading_checkpoint"
     )
-    callbacks.append(checkpoint_cb)
+    callbacks_list.append(checkpoint_cb)
 
-    # Custom callback for saving the best model (based on evaluation)
-    # This requires a proper evaluation environment setup.
-    # For now, this is a placeholder.
-    # eval_env = TradingEnv(some_validation_data, config) # Needs validation data
-    # eval_callback = EvalCallback(eval_env, best_model_save_path='./models/best_model/',
-    #                              log_path='./logs/results/', eval_freq=500,
-    #                              deterministic=True, render=False)
-    # callbacks.append(eval_callback)
+    # EvalCallback for saving best model and early stopping (optional)
+    best_model_save_path = os.path.join(config['training'].get('save_path', 'models/'), 'best_model')
+    os.makedirs(best_model_save_path, exist_ok=True)
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path=best_model_save_path,
+        log_path=os.path.join(config['training'].get('log_path', 'logs/'), 'eval_results'),
+        eval_freq=max(config['training'].get('eval_freq', 50000) // config['agent'].get('n_envs',1), 1),
+        n_eval_episodes=config['training'].get('eval_episodes', 5),
+        deterministic=config['training'].get('eval_deterministic', True),
+        render=False,
+        # callback_on_new_best= (optional: another callback here if best model found)
+        # stop_train_callback for early stopping (optional)
+    )
+    callbacks_list.append(eval_callback)
+    
+    # Add custom logging callback if defined and needed
+    # custom_log_cb = LoggingCallback(log_freq=1000)
+    # callbacks_list.append(custom_log_cb)
 
-    # Example of a custom SaveBestModelCallback (if defined in utils.callbacks)
-    # save_best_model_cb = SaveBestModelCallback(check_freq=..., log_dir=..., model_save_path=...)
-    # callbacks.append(save_best_model_cb)
-
-
-    # Train the agent
-    print(f"Training for {config.get('ppo_params', {}).get('total_timesteps', 1e6)} total timesteps...")
+    # --- Training ---
+    total_timesteps = int(config['training'].get('total_timesteps', 1e6))
+    logger.info(f"Starting training for {total_timesteps} total timesteps...")
+    
     try:
         model.learn(
-            total_timesteps=int(config.get('ppo_params', {}).get('total_timesteps', 1e6)),
-            callback=callbacks if callbacks else None,
-            tb_log_name=config.get('training_params', {}).get('tb_log_name', "PPO_TradingAgent")
+            total_timesteps=total_timesteps,
+            callback=callbacks_list if callbacks_list else None,
+            tb_log_name=config['training'].get('tb_log_name', "PPO_TradingAgent")
         )
-        print("Training finished.")
+        logger.info("Training finished.")
     except Exception as e:
-        print(f"An error occurred during training: {e}")
+        logger.error(f"An error occurred during training: {e}", exc_info=True)
         # Potentially save the model even if training is interrupted
-        # save_model(model, os.path.join(config.get('training_params',{}).get('model_save_path', './models/'), "ppo_trading_agent_interrupted.zip"), env if config.get('training_params',{}).get('normalize_env', False) else None)
+        interrupted_model_path = os.path.join(config['training'].get('save_path', 'models/'), "ppo_trading_agent_interrupted.zip")
+        model.save(interrupted_model_path)
+        logger.info(f"Interrupted model saved to {interrupted_model_path}")
+        if config['training'].get('normalize_env', False) and hasattr(train_env, 'save'):
+            interrupted_stats_path = os.path.join(config['training'].get('save_path', 'models/'), "vec_normalize_stats_interrupted.pkl")
+            train_env.save(interrupted_stats_path)
+            logger.info(f"VecNormalize stats for interrupted model saved to {interrupted_stats_path}")
         raise
 
-    # Save the final model
-    final_model_path = os.path.join(config.get('training_params',{}).get('model_save_path', './models/'), config.get('training_params',{}).get('final_model_name', "ppo_trading_agent_final.zip"))
-    save_model(model, final_model_path, env if config.get('training_params',{}).get('normalize_env', False) else None)
+    # --- Save Final Model and Normalization Stats ---
+    final_model_path = os.path.join(config['training'].get('save_path', 'models/'), config['training'].get('final_model_name', "ppo_trading_agent_final.zip"))
+    model.save(final_model_path)
+    logger.info(f"Final model saved to {final_model_path}")
     
-    # If using VecNormalize, save the running averages
-    if config.get('training_params', {}).get('normalize_env', False) and hasattr(env, 'save'):
-        normalize_stats_path = os.path.join(config.get('training_params',{}).get('model_save_path', './models/'), "vec_normalize_stats.pkl")
-        env.save(normalize_stats_path)
-        print(f"VecNormalize statistics saved to {normalize_stats_path}")
+    if config['training'].get('normalize_env', False) and hasattr(train_env, 'save'):
+        normalize_stats_path = os.path.join(config['training'].get('save_path', 'models/'), config['training'].get('vec_normalize_stats_name', "vec_normalize_stats.pkl"))
+        train_env.save(normalize_stats_path) # Save stats from the training environment
+        logger.info(f"VecNormalize statistics saved to {normalize_stats_path}")
 
-    env.close()
-    print("Training script completed.")
-
-
-def validate_agent(model, env):
-    """
-    (Optional) Validate the agent on a validation set during training.
-    This function would be called by a callback.
-    """
-    # This is a conceptual placeholder.
-    # Actual validation would involve running the model on a validation dataset
-    # and computing metrics like Sharpe ratio or cumulative return.
-    # Stable Baselines3 EvalCallback can handle this more systematically.
-    print("Validating agent (placeholder)...")
-    # Example:
-    # obs = env.reset()
-    # total_reward = 0
-    # for _ in range(len(env.df) -1): # Assuming env.df is validation data
-    #     action, _states = model.predict(obs, deterministic=True)
-    #     obs, rewards, dones, info = env.step(action)
-    #     total_reward += rewards
-    #     if dones:
-    #         break
-    # print(f"Validation episode reward: {total_reward}")
-    # return total_reward # Or other relevant metric
+    train_env.close()
+    eval_env.close()
+    logger.info("Training script completed.")
 
 
-def save_model(model, path, vec_normalize_env=None):
-    """
-    Save the trained model.
-    If VecNormalize was used, its statistics should also be saved.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    model.save(path)
-    print(f"Model saved to {path}")
-
-    # If VecNormalize is used, it's recommended to save its statistics separately
-    # as SB3's model.save() doesn't always handle it perfectly for continued training/evaluation.
-    # However, for PPO, SB3 typically bundles it if the environment passed to model.save() is the VecNormalized one.
-    # The explicit save in train_agent is a good practice.
-
-
-def main():
+# --- Main Execution Block ---
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO Agent for Adaptive Trading")
-    parser.add_argument("--config_path", type=str, default="src/config.py", help="Path to the configuration file")
-    # Allow overriding specific config values via CLI if needed, e.g.:
-    # parser.add_argument("--learning_rate", type=float, help="Override learning rate")
-
+    parser.add_argument(
+        "--config_path", 
+        type=str, 
+        default="configs/ppo_treasury_config.yaml", # Default to YAML in configs/
+        help="Path to the YAML configuration file"
+    )
     args = parser.parse_args()
 
-    # Load configuration
-    # This is a simplified way to load config. If config.py defines a dictionary,
-    # we can import it directly. If it's YAML/JSON, we parse it.
-    
-    config = {}
-    if args.config_path.endswith('.py'):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("config_module", args.config_path)
-        config_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(config_module)
-        config = getattr(config_module, 'DEFAULT_CONFIG', {}) # Assuming config.py has DEFAULT_CONFIG
-        # Potentially update config with CLI args here if needed
-    elif args.config_path.endswith(('.yaml', '.yml')):
+    # --- Load Configuration ---
+    # This will be replaced by: from utils.config_loader import load_config
+    # config = load_config(args.config_path) 
+    try:
         with open(args.config_path, 'r') as f:
             config = yaml.safe_load(f)
-    else:
-        print(f"Unsupported configuration file format: {args.config_path}. Using default config.")
-        config = DEFAULT_CONFIG # Fallback
+    except FileNotFoundError:
+        print(f"ERROR: Configuration file not found at {args.config_path}")
+        exit(1)
+    except Exception as e:
+        print(f"ERROR: Could not load or parse configuration file {args.config_path}: {e}")
+        exit(1)
 
-    # Ensure essential paths exist
-    if 'model_save_path' in config.get('training_params', {}):
-        os.makedirs(config['training_params']['model_save_path'], exist_ok=True)
-    if 'tensorboard_log_path' in config.get('training_params', {}):
-        os.makedirs(config['training_params']['tensorboard_log_path'], exist_ok=True)
+    # --- Setup Logger ---
+    # This will be replaced by: from utils.logger import setup_logger
+    # logger = setup_logger(config['logging'])
+    # For now, using print as a basic logger.
+    class SimpleLogger:
+        def info(self, msg): print(f"INFO: {msg}")
+        def warning(self, msg): print(f"WARNING: {msg}")
+        def error(self, msg, exc_info=False): print(f"ERROR: {msg}")
+    logger = SimpleLogger()
+    logger.info(f"Configuration loaded from {args.config_path}")
 
 
-    train_agent(config)
+    # --- Ensure essential paths from config exist ---
+    os.makedirs(config['training'].get('save_path', 'models/'), exist_ok=True)
+    os.makedirs(os.path.join(config['training'].get('log_path', 'logs/'), 'tensorboard'), exist_ok=True)
+    os.makedirs(os.path.join(config['training'].get('log_path', 'logs/'), 'eval_results'), exist_ok=True)
+    os.makedirs(config['data'].get('processed_data_path', 'data/processed/'), exist_ok=True)
 
-if __name__ == "__main__":
-    main()
+
+    train_agent(config, logger)

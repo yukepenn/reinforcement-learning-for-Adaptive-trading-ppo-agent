@@ -1,346 +1,294 @@
-import gym
-from gym import spaces
+import gymnasium as gym # Changed from gym to gymnasium
+from gymnasium import spaces # Changed from gym to gymnasium
 import numpy as np
 import pandas as pd
+from collections import deque # For recent_returns with a fixed window
 
 class TradingEnv(gym.Env):
     """
-    Custom OpenAI Gym environment for simulating trading of 10Y Treasury futures.
-
-    The environment state includes market features and optionally the current position.
-    Actions are discrete: 0 (Short), 1 (Flat), 2 (Long).
-    The reward function is shaped to promote risk-adjusted returns, penalizing
-    volatility and drawdowns.
+    Custom Gymnasium environment for simulating trading of 10Y Treasury futures.
+    Adheres to the Gymnasium API.
     """
-    metadata = {'render.modes': ['human']}
+    metadata = {'render_modes': ['human'], 'render_fps': 4} # Gymnasium metadata
 
-    def __init__(self, data_df, config, current_step_in_df=0):
+    def __init__(self, data_df, config, current_step_in_df=0, logger=None): # Added logger
         """
         Initializes the trading environment.
 
         Args:
             data_df (pd.DataFrame): DataFrame containing market data (prices and features).
-                                    Must have a 'price' column and feature columns as
-                                    specified in config['data']['feature_columns'].
-            config (dict): Configuration dictionary containing parameters for the environment,
-                           such as initial capital, transaction costs, reward coefficients, etc.
-            current_step_in_df (int): The starting step within the data_df. Useful if data_df is
-                                      a slice of a larger dataset (e.g. for evaluation on test set)
+            config (dict): Configuration dictionary.
+            current_step_in_df (int): Starting step within data_df.
+            logger (logging.Logger, optional): Logger instance.
         """
         super(TradingEnv, self).__init__()
 
-        self.df = data_df.copy() # Store the data
+        self.df = data_df.copy()
         self.config = config
-        
-        # Ensure 'price' column exists, critical for P&L calculation
-        if self.config['data']['price_column'] not in self.df.columns:
-            raise ValueError(f"Price column '{self.config['data']['price_column']}' not found in DataFrame.")
-        self.price_column = self.config['data']['price_column']
+        self.logger = logger if logger else SimpleLogger() # Use provided logger or a basic fallback
 
-        # Define feature columns from config
+        # Data parameters
+        self.price_column = self.config['data']['price_column']
+        if self.price_column not in self.df.columns:
+            self.logger.error(f"Price column '{self.price_column}' not found in DataFrame.")
+            raise ValueError(f"Price column '{self.price_column}' not found in DataFrame.")
+        
         self.feature_columns = self.config['data']['feature_columns']
         missing_features = [col for col in self.feature_columns if col not in self.df.columns]
         if missing_features:
+            self.logger.error(f"Missing feature columns in DataFrame: {missing_features}")
             raise ValueError(f"Missing feature columns in DataFrame: {missing_features}")
 
-        # Environment parameters
-        self.initial_capital = self.config['environment_params'].get('initial_capital', 1000000.0)
-        self.transaction_cost_pct = self.config['environment_params'].get('transaction_cost_pct', 0.0001)
-        self.max_drawdown_pct = self.config['environment_params'].get('max_drawdown_pct', 0.20)
-        self.stop_loss_penalty = self.config['environment_params'].get('stop_loss_penalty', -1.0)
-        self.include_position_in_state = self.config['environment_params'].get('include_position_in_state', True)
-        self.log_portfolio_value = self.config['environment_params'].get('log_portfolio_value', True)
+        # Environment parameters from config
+        env_cfg = self.config['environment_params']
+        self.initial_capital = env_cfg.get('initial_capital', 1000000.0)
         
+        # Transaction costs: config provides bps, convert to percentage for calculation
+        transaction_cost_bps = env_cfg.get('transaction_cost_bps', 0.5) 
+        self.transaction_cost_pct = transaction_cost_bps / 10000.0 # Convert bps to decimal percentage
+
+        self.max_drawdown_pct = env_cfg.get('max_drawdown_pct', 0.20)
+        self.stop_loss_penalty = env_cfg.get('stop_loss_penalty', -1.0)
+        self.include_position_in_state = env_cfg.get('include_position_in_state', True)
+        self.log_portfolio_value = env_cfg.get('log_portfolio_value', True)
+        self.episode_max_steps = env_cfg.get('episode_max_steps', None)
+
         # Reward shaping coefficients
-        self.lambda_pnl = self.config['environment_params'].get('reward_lambda_pnl', 1.0)
-        self.lambda_volatility = self.config['environment_params'].get('reward_lambda_volatility', 0.05)
-        self.lambda_drawdown = self.config['environment_params'].get('reward_lambda_drawdown', 0.1)
+        self.lambda_pnl = env_cfg.get('reward_lambda_pnl', 1.0)
+        self.lambda_volatility = env_cfg.get('reward_lambda_volatility', 0.05) # volatility_penalty_factor
+        self.lambda_drawdown = env_cfg.get('reward_lambda_drawdown', 0.1)   # drawdown_penalty_factor
+        
+        self.volatility_penalty_window = env_cfg.get('volatility_penalty_window', 20) # From config
 
         # Action space: 0 (Short), 1 (Flat), 2 (Long)
-        self.action_space = spaces.Discrete(3) # Short, Flat, Long
+        self.action_space = spaces.Discrete(3)
 
-        # Observation space: market features + current position (if included)
-        # Normalize features beforehand if necessary.
-        # The shape is number of features + 1 if position is included (as a single integer).
-        # If position is one-hot encoded, it would be +3. Here, using a single integer.
+        # Observation space
         obs_space_dim = len(self.feature_columns)
         if self.include_position_in_state:
-            obs_space_dim += 1
-        
-        # Assuming features are pre-normalized or will be handled by VecNormalize wrapper
+            obs_space_dim += 1 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_space_dim,), dtype=np.float32
         )
 
         # Episode management
-        self.current_step = current_step_in_df 
-        self.start_step = current_step_in_df # To reset to the correct beginning of the provided df slice
-        self.max_steps_in_df = len(self.df) -1 # Max index in the dataframe
+        self.current_step = 0 # This will be set correctly in reset() relative to start_step_in_df
+        self.start_step_in_df = current_step_in_df # The starting point in the *provided* df slice
+        self.max_steps_in_current_df = len(self.df) - 1
 
-        # Portfolio and position tracking
-        self.portfolio_value = self.initial_capital
-        self.peak_portfolio_value = self.initial_capital
-        self.current_position = 1 # Start Flat (0: Short, 1: Flat, 2: Long internal representation for position)
-                                  # This matches action space: 0=Short, 1=Flat, 2=Long for simplicity
-                                  # But for P&L: -1 for short, 0 for flat, 1 for long is more natural
-        self.current_pnl_pos_representation = 0 # -1 for short, 0 for flat, 1 for long
+        # Portfolio and position tracking (initialized in reset)
+        self.portfolio_value = 0.0
+        self.peak_portfolio_value = 0.0
+        self.current_position = 1 # 0:Short, 1:Flat, 2:Long (matches action space)
+        self.current_pnl_pos_representation = 0 # -1:Short, 0:Flat, 1:Long (for P&L calc)
+        self.recent_returns = deque(maxlen=self.volatility_penalty_window)
+        self.trade_history = [] # For potential detailed logging or analysis
 
-        # For volatility penalty, track recent returns
-        self.recent_returns = [] # Could be a deque with maxlen
-        self.volatility_penalty_window = 20 # Look at last 20 daily returns for vol penalty
-
-        print(f"TradingEnv initialized. Data length: {len(self.df)} steps. Start step: {self.start_step}")
         if self.df.empty:
-            print("Warning: TradingEnv initialized with empty DataFrame.")
+            self.logger.warning("TradingEnv initialized with empty DataFrame.")
+        self.logger.info(f"TradingEnv initialized. Data length: {len(self.df)} steps. Start step in df: {self.start_step_in_df}")
+        self.logger.info(f"Transaction cost: {self.transaction_cost_pct*100:.4f}% ({transaction_cost_bps} bps)")
 
 
     def _get_observation(self):
         """Constructs the observation vector for the current step."""
-        if self.current_step < 0 or self.current_step > self.max_steps_in_df:
-             # This case should ideally be prevented by done logic in step()
-            print(f"Warning: current_step {self.current_step} is out of bounds for df (0 to {self.max_steps_in_df}). Returning zero observation.")
-            obs_dim = self.observation_space.shape[0]
-            return np.zeros(obs_dim, dtype=np.float32)
+        actual_df_idx = self.start_step_in_df + self.current_step
+        
+        if actual_df_idx < 0 or actual_df_idx > self.max_steps_in_current_df:
+            self.logger.warning(f"current_step {self.current_step} (actual_df_idx {actual_df_idx}) is out of bounds for df (0 to {self.max_steps_in_current_df}). Returning zero observation.")
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
 
-        features = self.df[self.feature_columns].iloc[self.current_step].values.astype(np.float32)
+        features = self.df[self.feature_columns].iloc[actual_df_idx].values.astype(np.float32)
         
         if self.include_position_in_state:
-            # Represent position as 0 (Short), 1 (Flat), 2 (Long) to match action space directly
-            # Or normalize: (self.current_position - 1) maps to (-1, 0, 1)
-            position_feature = np.array([self.current_position], dtype=np.float32) 
+            position_feature = np.array([self.current_position], dtype=np.float32)
             observation = np.concatenate((features, position_feature))
         else:
             observation = features
-            
         return observation
 
-    def reset(self):
-        """Resets the environment to the initial state for a new episode."""
-        self.current_step = self.start_step # Reset to the beginning of the provided DataFrame slice
+    def reset(self, *, seed=None, options=None): # Gymnasium API
+        """Resets the environment for a new episode."""
+        super().reset(seed=seed) # Handles seeding for action_space.sample() etc.
+
+        self.current_step = 0 # Relative to the start of the episode
         
         self.portfolio_value = self.initial_capital
         self.peak_portfolio_value = self.initial_capital
-        self.current_position = 1  # Start Flat (0:Short, 1:Flat, 2:Long)
-        self.current_pnl_pos_representation = 0 # (Short:-1, Flat:0, Long:1)
+        self.current_position = 1  # Start Flat
+        self.current_pnl_pos_representation = 0 
 
-        self.recent_returns = []
+        self.recent_returns.clear()
+        self.trade_history = []
         
-        # print(f"Environment Reset. Current Step: {self.current_step}, Portfolio: {self.portfolio_value}")
-        return self._get_observation()
+        initial_obs = self._get_observation()
+        info = {"message": "Environment reset", "initial_portfolio_value": self.portfolio_value}
+        
+        # self.logger.debug(f"Env Reset. Initial Obs Shape: {initial_obs.shape}. Initial Portfolio: {self.portfolio_value}")
+        return initial_obs, info
 
     def step(self, action):
-        """
-        Advances the environment by one time step based on the agent's action.
+        """Advances the environment by one time step."""
+        terminated = False
+        truncated = False
+        
+        actual_df_idx = self.start_step_in_df + self.current_step
 
-        Args:
-            action (int): The agent's chosen action (0: Short, 1: Flat, 2: Long).
+        if actual_df_idx > self.max_steps_in_current_df:
+            # This should ideally be caught by termination/truncation logic before _get_observation is called for next step
+            self.logger.error("Step called when already past end of data. This indicates a logic flaw.")
+            obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+            return obs, 0, True, False, {"error": "Stepped past end of data"}
 
-        Returns:
-            tuple: (observation, reward, done, info)
-        """
-        if self.df.empty or self.current_step > self.max_steps_in_df :
-            # Should not happen if done is handled correctly
-            obs_dim = self.observation_space.shape[0]
-            return np.zeros(obs_dim, dtype=np.float32), 0, True, {}
 
-        # Store previous state for reward calculation
         prev_portfolio_value = self.portfolio_value
-        prev_position = self.current_position # Action space representation (0,1,2)
-        prev_pnl_pos = self.current_pnl_pos_representation # P&L representation (-1,0,1)
+        prev_position_action_code = self.current_position 
+        prev_pnl_pos = self.current_pnl_pos_representation
 
-        # Execute action: Update position
-        # Action: 0 (Short), 1 (Flat), 2 (Long)
-        # Position (current_position): 0 (Short), 1 (Flat), 2 (Long)
-        # P&L Position (current_pnl_pos_representation): -1 (Short), 0 (Flat), 1 (Long)
-        
-        self.current_position = action 
-        if action == 0: # Short
-            self.current_pnl_pos_representation = -1
-        elif action == 1: # Flat
-            self.current_pnl_pos_representation = 0
-        else: # Long (action == 2)
-            self.current_pnl_pos_representation = 1
+        # Update position based on action
+        self.current_position = int(action) # Ensure action is int
+        if self.current_position == 0: self.current_pnl_pos_representation = -1 # Short
+        elif self.current_position == 1: self.current_pnl_pos_representation = 0  # Flat
+        else: self.current_pnl_pos_representation = 1  # Long
             
-        # Calculate P&L from market movement
-        # Price change from current_step to current_step + 1 affects P&L for position held AT current_step
-        # So, we need price at current_step and current_step + 1
-        # If current_step is the last step, P&L from market movement is 0 as episode ends.
-        
+        # P&L from market movement
         pnl_from_market = 0
-        if self.current_step < self.max_steps_in_df:
-            current_price = self.df[self.price_column].iloc[self.current_step]
-            next_price = self.df[self.price_column].iloc[self.current_step + 1]
+        if (actual_df_idx + 1) <= self.max_steps_in_current_df: # Ensure there's a next price
+            current_price = self.df[self.price_column].iloc[actual_df_idx]
+            next_price = self.df[self.price_column].iloc[actual_df_idx + 1]
             price_change = next_price - current_price
-            pnl_from_market = prev_pnl_pos * price_change # prev_pnl_pos is position taken *before* this step's action
-                                                        # that is affected by price_change from t to t+1
+            pnl_from_market = prev_pnl_pos * price_change
+        else: # Last step in data, no P&L from market movement for this step's end
+            price_change = 0 
 
-        # Calculate transaction costs if position changed
+        # Transaction costs
         transaction_cost = 0
-        if self.current_position != prev_position: # If target position changed
-            # Simplified: cost applies per change of state (e.g. flat to long, or long to short)
-            # A more complex model could charge for closing and opening if reversing.
-            # For example, if prev_pos was Long (2) and current_pos is Short (0), it's one significant change.
-            # Cost is based on current price at the time of transaction.
-            current_price_for_cost = self.df[self.price_column].iloc[self.current_step]
+        if self.current_position != prev_position_action_code:
+            current_price_for_cost = self.df[self.price_column].iloc[actual_df_idx]
             cost_per_unit_trade = self.transaction_cost_pct * current_price_for_cost
             
-            # Number of "sides" traded. From Long to Short = 2 (close long, open short)
-            # From Long to Flat = 1. From Flat to Long = 1.
             if prev_pnl_pos != 0 and self.current_pnl_pos_representation != 0 and prev_pnl_pos != self.current_pnl_pos_representation:
                 transaction_cost = 2 * cost_per_unit_trade # Close and Open opposite
-            elif prev_pnl_pos != self.current_pnl_pos_representation: # Flat to Long/Short, or Long/Short to Flat
+            elif prev_pnl_pos != self.current_pnl_pos_representation:
                 transaction_cost = 1 * cost_per_unit_trade
-        
-        # Update portfolio value
+            self.trade_history.append({'step': self.current_step, 'action': self.current_position, 'price': current_price_for_cost, 'cost': transaction_cost})
+
+        # Update portfolio
         self.portfolio_value += pnl_from_market
         self.portfolio_value -= transaction_cost
-
-        # Update peak portfolio value for drawdown calculation
         self.peak_portfolio_value = max(self.peak_portfolio_value, self.portfolio_value)
 
-        # Calculate reward components
-        reward_pnl = self.lambda_pnl * (pnl_from_market - transaction_cost) # Net P&L after costs
+        # Reward components
+        reward_pnl = self.lambda_pnl * (pnl_from_market - transaction_cost)
 
-        # Volatility penalty (based on recent portfolio returns)
-        # Use change in portfolio value as a proxy for return if not holding cash aside
-        daily_return = 0
-        if prev_portfolio_value > 0: # Avoid division by zero if capital is somehow lost
-             daily_return = (self.portfolio_value - prev_portfolio_value) / prev_portfolio_value
-        
+        daily_return = (self.portfolio_value - prev_portfolio_value) / prev_portfolio_value if prev_portfolio_value != 0 else 0.0
         self.recent_returns.append(daily_return)
-        if len(self.recent_returns) > self.volatility_penalty_window:
-            self.recent_returns.pop(0)
         
         reward_volatility_penalty = 0
         if len(self.recent_returns) == self.volatility_penalty_window:
-            # Penalize squared returns or std dev of returns
-            # Using squared daily return as a simple proxy for volatility contribution
-            reward_volatility_penalty = self.lambda_volatility * (daily_return ** 2)
-            # Alternatively, std of recent_returns: self.lambda_volatility * np.std(self.recent_returns)
+            # Using squared daily portfolio return as volatility penalty source
+            reward_volatility_penalty = self.lambda_volatility * (daily_return ** 2) * 100 # Scaled up a bit
+            # Could also use: self.lambda_volatility * np.std(self.recent_returns)
 
-        # Drawdown penalty
-        current_drawdown = 0
-        if self.peak_portfolio_value > 0: # Avoid division by zero
-            current_drawdown = (self.peak_portfolio_value - self.portfolio_value) / self.peak_portfolio_value
+        current_drawdown = (self.peak_portfolio_value - self.portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0.0
+        reward_drawdown_penalty = self.lambda_drawdown * current_drawdown if current_drawdown > 0 else 0.0
         
-        reward_drawdown_penalty = 0
-        if current_drawdown > 0: # Only penalize if there is a drawdown
-            # Penalize proportionally to drawdown size
-            reward_drawdown_penalty = self.lambda_drawdown * current_drawdown
-            # Could also penalize only if it's a *new* max drawdown, or if it exceeds a threshold.
-
-        # Stop-loss logic
-        done = False
-        stop_loss_triggered = False
-        if current_drawdown > self.max_drawdown_pct:
-            done = True
-            stop_loss_triggered = True
-            reward_pnl += self.stop_loss_penalty # Apply large penalty for hitting stop-loss
-            print(f"Stop-loss triggered at step {self.current_step}. Drawdown: {current_drawdown*100:.2f}% > {self.max_drawdown_pct*100:.2f}%")
-
-
-        # Combine reward components
         reward = reward_pnl - reward_volatility_penalty - reward_drawdown_penalty
         
-        # Advance time step
-        self.current_step += 1
+        # Termination and Truncation
+        stop_loss_triggered = False
+        if current_drawdown > self.max_drawdown_pct:
+            terminated = True
+            stop_loss_triggered = True
+            reward += self.stop_loss_penalty 
+            self.logger.info(f"Stop-loss triggered at step {self.current_step}. Drawdown: {current_drawdown*100:.2f}%")
 
-        # Check if episode is done
-        if not done and self.current_step > self.max_steps_in_df : # End of data
-            done = True
+        self.current_step += 1 # Advance internal step counter for the episode
+
+        if not terminated and (self.start_step_in_df + self.current_step) > self.max_steps_in_current_df:
+            terminated = True # End of available data for this episode run
+
+        if not terminated and self.episode_max_steps is not None and self.current_step >= self.episode_max_steps:
+            truncated = True # Reached max configured steps for an episode
         
-        # Max episode steps from config (if any)
-        if self.config['environment_params'].get('episode_max_steps') is not None:
-            if (self.current_step - self.start_step) >= self.config['environment_params']['episode_max_steps']:
-                done = True
-        
-        # Information dictionary
+        # Get next observation
+        observation = self._get_observation() if not (terminated or truncated) else np.zeros(self.observation_space.shape, dtype=np.float32)
+
         info = {
-            'step': self.current_step,
             'portfolio_value': self.portfolio_value if self.log_portfolio_value else 'not_logged',
-            'current_position': self.current_position, # 0:S, 1:F, 2:L
-            'pnl_pos_representation': self.current_pnl_pos_representation, # -1:S, 0:F, 1:L
+            'pnl_pos_representation': self.current_pnl_pos_representation,
             'transaction_cost': transaction_cost,
             'pnl_from_market': pnl_from_market,
+            'reward_pnl_component': reward_pnl,
+            'reward_vol_penalty_component': -reward_volatility_penalty,
+            'reward_dd_penalty_component': -reward_drawdown_penalty,
+            'daily_return': daily_return,
             'drawdown_pct': current_drawdown * 100,
-            'stop_loss_triggered': stop_loss_triggered,
-            'reward_components': {
-                'pnl_reward': reward_pnl,
-                'vol_penalty': -reward_volatility_penalty,
-                'dd_penalty': -reward_drawdown_penalty
-            }
+            'stop_loss_triggered': stop_loss_triggered
         }
         
-        return self._get_observation(), reward, done, info
+        return observation, reward, terminated, truncated, info
 
-    def render(self, mode='human', close=False):
-        """(Optional) Renders the environment, e.g., by printing current status."""
+    def render(self, mode='human'): # Gymnasium API uses 'mode', not 'render_modes'
+        """Renders the environment status."""
         if mode == 'human':
-            print(f"Step: {self.current_step}, Portfolio Value: {self.portfolio_value:.2f}, "
-                  f"Position: {self.current_pnl_pos_representation} (-1S,0F,1L), "
+            actual_df_idx = self.start_step_in_df + self.current_step -1 # -1 because current_step was already incremented
+            price_info = f"Price: {self.df[self.price_column].iloc[actual_df_idx]:.2f}" if actual_df_idx < len(self.df) else "Price: N/A"
+            
+            print(f"Step: {self.current_step}, DF Idx: {actual_df_idx}, {price_info}, "
+                  f"Portfolio: {self.portfolio_value:.2f}, Position: {self.current_pnl_pos_representation}, "
                   f"Drawdown: {( (self.peak_portfolio_value - self.portfolio_value) / self.peak_portfolio_value if self.peak_portfolio_value > 0 else 0) * 100:.2f}%")
 
     def close(self):
-        """(Optional) Perform any necessary cleanup."""
-        # print("TradingEnv closed.")
+        """Perform any necessary cleanup."""
+        # self.logger.info("TradingEnv closed.")
         pass
 
+# Dummy logger for standalone execution if actual logger isn't passed
+class SimpleLogger:
+    def debug(self, msg): print(f"DEBUG: {msg}")
+    def info(self, msg): print(f"INFO: {msg}")
+    def warning(self, msg): print(f"WARNING: {msg}")
+    def error(self, msg, exc_info=False): print(f"ERROR: {msg}")
+
 if __name__ == '__main__':
-    # Example Usage (requires a dummy config and data)
-    print("Example Usage of TradingEnv:")
-
-    # Create dummy data
-    num_days = 200
-    price_data = np.random.randn(num_days).cumsum() + 100
-    feature_data_1 = np.random.rand(num_days) * 10
-    feature_data_2 = np.random.rand(num_days) * 5
-    
+    print("Example Usage of TradingEnv (Gymnasium compliant):")
     dummy_df = pd.DataFrame({
-        'price': price_data,
-        'yield_curve_slope': feature_data_1,
-        'volatility_20d': feature_data_2,
-        'ma_crossover_signal': np.random.randint(-1, 2, size=num_days),
-        'momentum_1m': np.random.randn(num_days)
-    })
+        'Date': pd.to_datetime([f'2020-01-{i+1:02d}' for i in range(200)]),
+        'price': np.random.randn(200).cumsum() + 100,
+        'yield_curve_slope': np.random.rand(200) * 10,
+        'volatility_20d': np.random.rand(200) * 5,
+        'ma_crossover_signal': np.random.randint(-1, 2, size=200),
+        'momentum_1m': np.random.randn(200)
+    }).set_index('Date')
 
-    # Dummy config (subset of what's in config.py)
-    dummy_config = {
-        "data": {
-            "price_column": "price",
-            "feature_columns": ["yield_curve_slope", "volatility_20d", "ma_crossover_signal", "momentum_1m"]
-        },
+    dummy_yaml_config = {
+        "data": {"price_column": "price", "feature_columns": ["yield_curve_slope", "volatility_20d", "ma_crossover_signal", "momentum_1m"]},
         "environment_params": {
-            "initial_capital": 100000,
-            "transaction_cost_pct": 0.001, # Higher cost for testing
-            "max_drawdown_pct": 0.15,
-            "stop_loss_penalty": -100, # Large penalty
-            "include_position_in_state": True,
-            "log_portfolio_value": True,
-            "reward_lambda_pnl": 1.0,
-            "reward_lambda_volatility": 0.1,
-            "reward_lambda_drawdown": 0.2,
-            "episode_max_steps": None 
+            "initial_capital": 100000, "transaction_cost_bps": 1.0, # 1 bps
+            "max_drawdown_pct": 0.15, "stop_loss_penalty": -100,
+            "include_position_in_state": True, "log_portfolio_value": True,
+            "reward_lambda_pnl": 1.0, "reward_lambda_volatility": 0.1, "reward_lambda_drawdown": 0.2,
+            "volatility_penalty_window": 10, "episode_max_steps": 50 
         }
     }
-
-    env = TradingEnv(data_df=dummy_df, config=dummy_config)
-    obs = env.reset()
-    print(f"Initial Observation: {obs}")
-    print(f"Observation Space: {env.observation_space}")
-    print(f"Action Space: {env.action_space}")
+    test_logger = SimpleLogger()
+    env = TradingEnv(data_df=dummy_df, config=dummy_yaml_config, logger=test_logger)
+    
+    obs, info = env.reset(seed=42)
+    test_logger.info(f"Initial Observation: {obs[:4]}... Shape: {obs.shape}")
+    test_logger.info(f"Reset Info: {info}")
 
     total_reward_sum = 0
-    for i in range(num_days - 5): # Run for a few steps less than total to avoid end-of-data issues in simple example
-        action = env.action_space.sample()  # Sample random action
-        obs, reward, done, info = env.step(action)
+    for i in range(100): # Max 100 steps for this test
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
         total_reward_sum += reward
-        # env.render() # Print step info
-        if i % 50 == 0 :
-            print(f"Step {i}: Action: {action}, Reward: {reward:.4f}, Portfolio: {info.get('portfolio_value',0):.2f}, Done: {done}")
-            # print(f"   Info: {info}")
-        if done:
-            print(f"Episode finished after {i+1} steps. Final Portfolio: {info.get('portfolio_value',0):.2f}")
+        if i % 10 == 0:
+            # env.render() # Print step info using render
+            test_logger.info(f"Step {i}: Action: {action}, Reward: {reward:.4f}, Term: {terminated}, Trunc: {truncated}, PV: {info.get('portfolio_value',0):.2f}")
+        if terminated or truncated:
+            test_logger.info(f"Episode finished after {i+1} steps. Final Info: {info}")
             break
-    
-    print(f"Total reward for random actions: {total_reward_sum:.2f}")
+    test_logger.info(f"Total reward for random actions: {total_reward_sum:.2f}")
     env.close()

@@ -1,0 +1,30 @@
+# Core scientific libraries
+numpy
+pandas
+
+# Machine Learning - Reinforcement Learning
+stable-baselines3[extra]>=2.0.0a5 # Includes PyTorch, Gymnasium, etc. extras recommended
+gymnasium>=0.28.0 # Ensure it's a version compatible with SB3
+
+# Configuration
+PyYAML>=6.0
+
+# Feature Scaling & Model Persistence
+scikit-learn>=1.0
+joblib>=1.1
+
+# Plotting & Visualization
+matplotlib>=3.5
+seaborn>=0.11
+
+# Explainability (Optional but planned)
+shap>=0.40
+
+# Hyperparameter Tuning (Optional but planned)
+# optuna>=3.0
+
+# Testing
+pytest>=7.0
+
+# Add specific versions if known or after setting up and freezing the environment
+# e.g., pandas==1.5.3
